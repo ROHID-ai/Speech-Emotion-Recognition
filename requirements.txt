@@ -1,6 +1,9 @@
-# Core Deep Learning & Audio Frameworks
+# Render / CPU Linux — do NOT use CUDA wheels
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Core Deep Learning & Audio Frameworks (Python 3.11 compatible)
 tensorflow==2.16.1
-torch==2.2.1 --extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.1
 transformers==4.38.2
 
 # Audio Processing Tools
@@ -12,8 +15,7 @@ audioread==3.0.1
 numpy==1.26.4
 tqdm==4.66.2
 
-#Backend
-python-multipart
-fastapi
-uvicorn
-
+# Backend
+python-multipart==0.0.20
+fastapi==0.115.12
+uvicorn[standard]==0.34.2

@@ -1,0 +1,26 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# After pushing, create the service from this file or copy the settings below.
+
+services:
+  - type: web
+    name: speech-emotion-recognition
+    runtime: python
+    plan: standard # Free (512MB) will OOM with TF+Torch+HuBERT. Use at least 2GB.
+    region: oregon
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: "3"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      - key: HF_HOME
+        value: /opt/render/project/src/.cache/huggingface
+      - key: TRANSFORMERS_CACHE
+        value: /opt/render/project/src/.cache/huggingface
