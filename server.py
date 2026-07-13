@@ -1,21 +1,21 @@
 """
 FastAPI Speech Emotion Recognition API.
 
-IMPORTANT (Render): Heavy ML imports and HuBERT weights are NOT loaded at
-module import time. Uvicorn must bind to $PORT quickly so Render's deploy
-health check can succeed. Models load lazily on the first /predict request.
+Models are loaded during application lifespan startup (not at import time,
+and not deferred until the first /predict). GET / reports models_ready /
+models_error so Render logs and health checks expose real load failures.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
-import threading
+import traceback
 import warnings
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-# Quiet TensorFlow once it is eventually imported.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,10 +25,11 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 # ==========================================
-# CONFIGURATION
+# PATHS — server.py and weights live in the same directory (repo root).
+# Do NOT use parent.parent; that points outside the project on Render.
 # ==========================================
 BASE_DIR = Path(__file__).resolve().parent
-WEIGHTS_PATH = BASE_DIR / "best_hubert_emotion.weights.h5"
+WEIGHTS_PATH = (BASE_DIR / "best_hubert_emotion.weights.h5").resolve()
 TARGET_SR = 16000
 MAX_FRAMES = 199
 HUBERT_MODEL_ID = "facebook/hubert-base-ls960"
@@ -44,24 +45,18 @@ INV_EMOTION_MAP = {
     7: "Surprised",
 }
 
-# Lazy-loaded globals (filled by ensure_models_loaded)
-_feature_extractor = None
-_hubert_model = None
-_classifier = None
-_tf = None
-_models_ready = False
-_models_error: str | None = None
-_load_lock = threading.Lock()
-
-
-class HubertEmotionClassifier:
-    """Keras model wrapper; real class is built after TensorFlow import."""
-
-    pass
+# Runtime model state (set by load_models_at_startup)
+feature_extractor = None
+hubert_model = None
+classifier = None
+models_ready = False
+models_error: str | None = None
 
 
 def _build_classifier(tf_module: Any, num_classes: int = 8):
-    class _HubertEmotionClassifier(tf_module.keras.Model):
+    """Build the Keras emotion head used with HuBERT layer-7 features."""
+
+    class HubertEmotionClassifier(tf_module.keras.Model):
         def __init__(self, num_classes: int = 8):
             super().__init__()
             reg = tf_module.keras.regularizers.l2(1e-4)
@@ -98,63 +93,106 @@ def _build_classifier(tf_module: Any, num_classes: int = 8):
             x = self.final_dropout(x, training=training)
             return self.classifier(x)
 
-    return _HubertEmotionClassifier(num_classes=num_classes)
+    return HubertEmotionClassifier(num_classes=num_classes)
 
 
-def ensure_models_loaded() -> None:
-    """Load Torch/TF/HuBERT/classifier once. Safe to call from multiple threads."""
-    global _feature_extractor, _hubert_model, _classifier, _tf
-    global _models_ready, _models_error
+def verify_required_files() -> None:
+    """Fail fast with clear messages if local artifacts are missing."""
+    print(f"[startup] BASE_DIR (absolute)     = {BASE_DIR}")
+    print(f"[startup] WEIGHTS_PATH (absolute) = {WEIGHTS_PATH}")
+    print(f"[startup] WEIGHTS_PATH exists     = {WEIGHTS_PATH.is_file()}")
+    print(f"[startup] cwd                     = {Path.cwd().resolve()}")
+    print(f"[startup] repo listing            = {sorted(p.name for p in BASE_DIR.iterdir())}")
 
-    if _models_ready:
-        return
-    if _models_error:
-        raise RuntimeError(_models_error)
+    if not WEIGHTS_PATH.is_file():
+        raise FileNotFoundError(
+            "Missing required model file: best_hubert_emotion.weights.h5\n"
+            f"Expected absolute path: {WEIGHTS_PATH}\n"
+            f"BASE_DIR contents: {sorted(p.name for p in BASE_DIR.iterdir())}\n"
+            "HuBERT itself is downloaded from Hugging Face "
+            f"({HUBERT_MODEL_ID}) and is not a local file."
+        )
 
-    with _load_lock:
-        if _models_ready:
-            return
-        if _models_error:
-            raise RuntimeError(_models_error)
 
-        try:
-            print("Loading ML dependencies and models (first request only)...")
+def load_models_at_startup() -> None:
+    """
+    Load all models used by this API:
 
-            if not WEIGHTS_PATH.is_file():
-                raise FileNotFoundError(
-                    f"Classifier weights not found at {WEIGHTS_PATH}. "
-                    "Ensure best_hubert_emotion.weights.h5 is deployed with the service."
-                )
+    1) Wav2Vec2FeatureExtractor + HubertModel (PyTorch / transformers)
+    2) HubertEmotionClassifier weights (TensorFlow / Keras .h5)
 
-            import numpy as np  # noqa: F401
-            import torch
-            import tensorflow as tf
-            from transformers import HubertModel, Wav2Vec2FeatureExtractor
+    There is no separate torch.load() emotion checkpoint in this project.
+    """
+    global feature_extractor, hubert_model, classifier
+    global models_ready, models_error
 
-            _tf = tf
+    models_ready = False
+    models_error = None
 
-            feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(HUBERT_MODEL_ID)
-            hubert_model = HubertModel.from_pretrained(HUBERT_MODEL_ID)
-            hubert_model.eval()
+    try:
+        verify_required_files()
 
-            classifier = _build_classifier(tf, num_classes=8)
-            # Build variables, then load trained weights.
-            classifier(tf.zeros((1, MAX_FRAMES, 768)))
-            classifier.load_weights(str(WEIGHTS_PATH))
+        print("Loading PyTorch / Transformers stack...")
+        import torch
+        from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
-            _feature_extractor = feature_extractor
-            _hubert_model = hubert_model
-            _classifier = classifier
-            _models_ready = True
-            print("Models loaded. Inference ready.")
-        except Exception as exc:
-            _models_error = f"Model initialization failed: {exc}"
-            print(_models_error)
-            raise RuntimeError(_models_error) from exc
+        print(f"Loading HuBERT... ({HUBERT_MODEL_ID})")
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(HUBERT_MODEL_ID)
+        hubert_model = HubertModel.from_pretrained(HUBERT_MODEL_ID)
+        hubert_model.eval()
+        print(
+            f"HuBERT loaded. torch={torch.__version__}, "
+            f"device=cpu, eval={not hubert_model.training}"
+        )
+
+        print("Loading TensorFlow / Keras emotion classifier...")
+        import tensorflow as tf
+
+        classifier = _build_classifier(tf, num_classes=8)
+        # Build variables before loading trained weights.
+        classifier(tf.zeros((1, MAX_FRAMES, 768)))
+        print(f"Loading TensorFlow model weights from: {WEIGHTS_PATH}")
+        classifier.load_weights(str(WEIGHTS_PATH))
+        print(f"TensorFlow loaded. tf={tf.__version__}")
+
+        models_ready = True
+        models_error = None
+        print("All models loaded successfully.")
+    except Exception as e:
+        traceback.print_exc()
+        models_ready = False
+        models_error = f"{type(e).__name__}: {e}"
+        print(f"[startup] MODEL LOAD FAILED: {models_error}")
+        # Keep the HTTP server up so GET / can expose models_error on Render.
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    print("[startup] lifespan begin — loading models")
+    load_models_at_startup()
+    if models_ready:
+        print("[startup] lifespan complete — models_ready=True")
+    else:
+        print(f"[startup] lifespan complete — models_ready=False error={models_error}")
+    yield
+    print("[shutdown] lifespan end")
+
+
+app = FastAPI(title="Emotion Recognition API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def predict_emotion(audio_path: str) -> dict:
-    ensure_models_loaded()
+    if not models_ready:
+        raise RuntimeError(
+            models_error or "Models are not loaded. Check / for models_error."
+        )
 
     import librosa
     import numpy as np
@@ -164,12 +202,12 @@ def predict_emotion(audio_path: str) -> dict:
     speech, _sr = librosa.load(audio_path, sr=TARGET_SR)
     speech = librosa.util.normalize(speech)
 
-    input_values = _feature_extractor(
+    input_values = feature_extractor(
         speech, return_tensors="pt", sampling_rate=TARGET_SR
     ).input_values
 
     with torch.no_grad():
-        outputs = _hubert_model(input_values, output_hidden_states=True)
+        outputs = hubert_model(input_values, output_hidden_states=True)
         layer_features = outputs.hidden_states[7].squeeze(0).numpy()
 
     num_frames = layer_features.shape[0]
@@ -183,7 +221,7 @@ def predict_emotion(audio_path: str) -> dict:
 
     final_features = np.expand_dims(final_features, axis=0)
 
-    logits = _classifier(final_features, training=False)
+    logits = classifier(final_features, training=False)
     probabilities = tf.nn.softmax(logits).numpy()[0]
     predicted_class = int(np.argmax(probabilities))
 
@@ -196,36 +234,39 @@ def predict_emotion(audio_path: str) -> dict:
     }
 
 
-# ==========================================
-# APP (binds immediately — no model load here)
-# ==========================================
-app = FastAPI(title="Emotion Recognition API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @app.get("/")
 def root():
-    """Health endpoint used by Render. Must stay lightweight."""
     return {
-        "message": "Emotion Recognition API is running",
-        "models_ready": _models_ready,
-        "models_error": _models_error,
+        "message": (
+            "Emotion Recognition API is running"
+            if models_ready
+            else "Emotion Recognition API is running, but models failed to load"
+        ),
+        "models_ready": models_ready,
+        "models_error": models_error,
+        "weights_path": str(WEIGHTS_PATH),
+        "weights_exists": WEIGHTS_PATH.is_file(),
+        "base_dir": str(BASE_DIR),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_ready": _models_ready}
+    return {
+        "status": "ok" if models_ready else "degraded",
+        "models_ready": models_ready,
+        "models_error": models_error,
+    }
 
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    if not models_ready:
+        raise HTTPException(
+            status_code=503,
+            detail=models_error or "Models are not loaded yet",
+        )
+
     if not file.filename or not file.filename.lower().endswith(
         (".wav", ".mp3", ".flac", ".ogg", ".m4a")
     ):
@@ -241,12 +282,11 @@ async def predict(file: UploadFile = File(...)):
 
         try:
             return predict_emotion(tmp_path)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except Exception as exc:
+        except Exception as e:
+            traceback.print_exc()
             raise HTTPException(
-                status_code=500, detail=f"Inference failed: {exc}"
-            ) from exc
+                status_code=500, detail=f"Inference failed: {type(e).__name__}: {e}"
+            ) from e
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)

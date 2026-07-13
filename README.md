@@ -38,11 +38,17 @@ HF_HOME=/opt/render/project/src/.cache/huggingface
 TRANSFORMERS_CACHE=/opt/render/project/src/.cache/huggingface
 ```
 
-### Why deploys used to hang at "Deploying..."
+### Model loading
 
-`server.py` previously loaded TensorFlow, PyTorch, and downloaded HuBERT **at import time**, before Uvicorn could bind `$PORT`. Render waits for an open port after `WEB_CONCURRENCY=1`, so the service sat on "Deploying..." until timeout / OOM.
+Models load in the FastAPI **lifespan startup** hook (not at import time, not on first request).
 
-Models now load **lazily on the first `/predict` request**. The process binds immediately and `/` returns healthy.
+After deploy, `GET /` should show `"models_ready": true`. If load fails, `"models_error"` contains the exception and Render logs include the full traceback.
+
+Required local file (repo root, next to `server.py`):
+
+- `best_hubert_emotion.weights.h5`
+
+HuBERT (`facebook/hubert-base-ls960`) is downloaded from Hugging Face on startup (not a local file).
 
 ### Entry point
 
